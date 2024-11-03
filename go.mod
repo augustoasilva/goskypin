@@ -10,6 +10,7 @@ require (
 )
 
 require (
+	github.com/augustoasilva/go-lazuli v0.3.0 // indirect
 	github.com/ipfs/go-block-format v0.2.0 // indirect
 	github.com/ipfs/go-ipfs-util v0.0.3 // indirect
 	github.com/ipfs/go-ipld-cbor v0.1.0 // indirect

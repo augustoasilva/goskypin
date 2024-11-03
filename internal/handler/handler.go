@@ -2,14 +2,15 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 
-	"github.com/augustoasilva/goskyrepost/internal/repost"
-	"github.com/augustoasilva/goskyrepost/pkg/atprotocol"
+	"github.com/augustoasilva/go-lazuli/pkg/lazuli"
+	"github.com/augustoasilva/go-lazuli/pkg/lazuli/bsky"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/ipfs/go-cid"
 	carv2 "github.com/ipld/go-car/v2"
@@ -17,30 +18,32 @@ import (
 
 var terms = []string{"#repostbot"}
 
-var EventFn = func(evt atprotocol.RepoCommitEvent) error {
-	for _, op := range evt.Ops {
-		if op.Action == "create" {
-			if len(evt.Blocks) > 0 {
-				err := handleCARBlocks(evt.Blocks, op)
-				if err != nil {
-					slog.Error("erro ao processar os blocos do CAR", "error", err)
-					return err
+func GetEventFn(ctx context.Context, client lazuli.Client) func(evt bsky.CommitEvent) error {
+	handler := func(evt bsky.CommitEvent) error {
+		for _, op := range evt.GetOps() {
+			if op.Action == "create" {
+				if len(evt.GetBlocks()) > 0 {
+					err := handleCARBlocks(ctx, evt, op, client)
+					if err != nil {
+						slog.Error("error processing car blocks", "error", err)
+						return err
+					}
 				}
 			}
 		}
+		return nil
 	}
-
-	return nil
+	return handler
 }
 
-func handleCARBlocks(blocks []byte, op atprotocol.RepoOperation) error {
-	if len(blocks) == 0 {
-		return errors.New("não existem blocos para processar")
+func handleCARBlocks(ctx context.Context, evt bsky.CommitEvent, op bsky.RepoOperation, client lazuli.Client) error {
+	if len(evt.GetBlocks()) == 0 {
+		return errors.New("there is no blocks to process")
 	}
 
-	reader, err := carv2.NewBlockReader(bytes.NewReader(blocks))
+	reader, err := carv2.NewBlockReader(bytes.NewReader(evt.GetBlocks()))
 	if err != nil {
-		slog.Error("erro ao criar reader para ler os blocos do CAR", "error", err)
+		slog.Error("error creating reader for car blocks", "error", err)
 		return err
 	}
 
@@ -51,38 +54,82 @@ func handleCARBlocks(blocks []byte, op atprotocol.RepoOperation) error {
 		}
 
 		if readErr != nil {
-			slog.Error("erro ao ler um bloco do CAR", "error", readErr)
+			slog.Error("error reading car block", "error", readErr)
 			break
 		}
 
 		c, cidErr := getCidFromOp(op)
 		if cidErr != nil {
-			slog.Error("erro ao pegar o CID da operação do evento", "error", cidErr)
+			slog.Error("error getting CID from events operation", "error", cidErr)
 			continue
 		}
 
 		if block.Cid().Equals(*c) {
-			var post atprotocol.PostRecord
-			if unmarshalErr := cbor.Unmarshal(block.RawData(), &post); unmarshalErr != nil {
-				slog.Error("erro ao decodificar o bloco CAR usando CBOR", "error", unmarshalErr)
-				continue
-			}
+			var rawData map[string]any
+			_ = cbor.Unmarshal(block.RawData(), &rawData)
+			if rawData["$type"] != nil {
+				slog.Info("car block read", "op_path", op.Path, "raw_data", rawData)
+				if rawData["$type"].(string) == "app.bsky.feed.post" {
+					var postRecord bsky.PostRecord
+					if unmarshalErr := cbor.Unmarshal(block.RawData(), &postRecord); unmarshalErr != nil {
+						slog.Error("error decoding car block using CBOR", "error", unmarshalErr)
+					}
 
-			if post.Text == "" || post.Reply == nil {
-				continue
-			}
+					if postRecord.Reply != nil && postRecord.Text != "" {
+						if filterTerms(postRecord.Text) {
+							postParams := bsky.CreateRecordParams{
+								URI: postRecord.Reply.Parent.URI,
+								CID: postRecord.Reply.Parent.CID,
+							}
 
-			if filterTerms(post.Text) {
-				_ = repost.Repost(&post)
+							repostErr := client.CreateRepostRecord(ctx, postParams)
+							if repostErr != nil {
+								slog.Error("error reposting", "error", repostErr)
+								continue
+							}
+
+							likeErr := client.CreateLikeRecord(ctx, postParams)
+							if likeErr != nil {
+								slog.Error("error liking", "error", likeErr)
+							}
+						}
+					}
+
+					if postRecord.Text != "" {
+						if filterTerms(postRecord.Text) {
+							uri := "at://" + evt.GetRepo() + "/" + op.Path
+							post, getErr := client.GetPost(ctx, uri)
+							if getErr != nil {
+								slog.Error("error getting post data", "error", getErr)
+								continue
+							}
+
+							postParams := bsky.CreateRecordParams{
+								URI: post.URI,
+								CID: post.CID.(string),
+							}
+
+							repostErr := client.CreateRepostRecord(ctx, postParams)
+							if repostErr != nil {
+								slog.Error("error reposting", "error", repostErr)
+								continue
+							}
+
+							likeErr := client.CreateLikeRecord(ctx, postParams)
+							if likeErr != nil {
+								slog.Error("error liking", "error", likeErr)
+							}
+						}
+					}
+				}
 			}
 		}
-
 	}
 
 	return nil
 }
 
-func getCidFromOp(op atprotocol.RepoOperation) (*cid.Cid, error) {
+func getCidFromOp(op bsky.RepoOperation) (*cid.Cid, error) {
 	if opTag, ok := op.CID.(cbor.Tag); ok {
 		if cidBytes, ok := opTag.Content.([]byte); ok {
 			return decodeCID(cidBytes)
